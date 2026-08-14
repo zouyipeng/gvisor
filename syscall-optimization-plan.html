@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gVisor FEAT_FGT 使能设计文档 v4</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --border: #334155;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --accent: #38bdf8;
+    --accent2: #a78bfa;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --code-bg: #0f172a;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', system-ui, sans-serif;
+    line-height: 1.7;
+    padding: 40px 20px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .header {
+    text-align: center;
+    padding: 50px 0 30px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 40px;
+  }
+  .header h1 {
+    font-size: 2.2em;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 10px;
+  }
+  .header .subtitle { color: var(--text-dim); font-size: 1.05em; }
+  .header .meta { margin-top: 14px; color: var(--text-dim); font-size: 0.88em; }
+
+  .toc {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 28px;
+    margin-bottom: 32px;
+  }
+  .toc h2 { font-size: 1.05em; color: var(--accent); margin-bottom: 10px; }
+  .toc ul { list-style: none; }
+  .toc li { margin: 5px 0; }
+  .toc a { color: var(--text-dim); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+
+  .section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+    margin-bottom: 24px;
+  }
+  .section h2 {
+    font-size: 1.35em;
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section h3 { font-size: 1.1em; color: var(--accent); margin: 20px 0 10px; }
+  .section p { margin: 8px 0; color: var(--text-dim); }
+
+  pre, .diagram {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 12px 0;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', 'Cascadia Code', monospace;
+    font-size: 0.82em;
+    line-height: 1.5;
+    white-space: pre;
+  }
+
+  code {
+    font-family: 'JetBrains Mono', 'Cascadia Code', monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: var(--accent);
+  }
+
+  .highlight-box {
+    border-left: 4px solid var(--accent);
+    background: rgba(56, 189, 248, 0.06);
+    padding: 14px 18px;
+    margin: 12px 0;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.92em;
+    color: var(--text-dim);
+  }
+  .highlight-box.warn { border-left-color: var(--yellow); background: rgba(251, 191, 36, 0.06); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 0.88em;
+  }
+  th, td { padding: 8px 12px; border: 1px solid var(--border); text-align: left; }
+  th { background: var(--code-bg); color: var(--accent); font-weight: 600; }
+  td { color: var(--text-dim); }
+
+  .file-list { list-style: none; }
+  .file-list li {
+    padding: 6px 10px;
+    margin: 3px 0;
+    background: var(--code-bg);
+    border-radius: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.83em;
+  }
+  .file-list li .new { color: var(--accent); font-weight: 600; }
+  .file-list li .mod { color: var(--green); font-weight: 600; }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 12px 0;
+  }
+  @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .card-mini {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .card-mini h4 { font-size: 0.92em; margin-bottom: 6px; }
+  .card-mini p { font-size: 0.83em; margin: 4px 0; color: var(--text-dim); }
+
+  .footer {
+    text-align: center;
+    padding: 30px 0;
+    color: var(--text-dim);
+    font-size: 0.85em;
+    border-top: 1px solid var(--border);
+    margin-top: 30px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <h1>gVisor FEAT_FGT 使能设计</h1>
+  <div class="subtitle">基于 ARM64 FEAT_FGT 特性的 SVC 跳转行为改造（Systrap 平台）</div>
+  <div class="meta">
+    <strong>作者:</strong> Zou Yipeng &middot;
+    <strong>日期:</strong> 2026-08-06 &middot;
+    <strong>版本:</strong> v4.0 &middot;
+    <strong>范围:</strong> ARM64 / Systrap / QEMU TCG
+  </div>
+</div>
+
+<div class="toc">
+  <h2>目录</h2>
+  <ul>
+    <li><a href="#s1">1. FEAT_FGT 硬件接口</a></li>
+    <li><a href="#s2">2. 当前 Systrap Syscall 路径</a></li>
+    <li><a href="#s3">3. 使能机制（动态开关）</a></li>
+    <li><a href="#s4">4. 跳转入口（Handler）设计</a></li>
+    <li><a href="#s5">5. 日志设计</a></li>
+    <li><a href="#s6">6. 代码修改清单</a></li>
+    <li><a href="#s7">7. 验证方案</a></li>
+    <li><a href="#s8">8. 风险</a></li>
+  </ul>
+</div>
+
+<!-- ==================== 1. FEAT_FGT 硬件接口 ==================== -->
+<div class="section" id="s1">
+  <h2>1. FEAT_FGT 硬件接口</h2>
+
+  <p>FEAT_FGT 提供 EL0 SVC 指令的硬件重定向：应用执行 <code>SVC</code> 时，PC 直接跳转到 <strong>VBAR_EL0_FDT</strong> 注册的入口，<strong>不经过 EL0→EL1 异常向量表</strong>。</p>
+
+  <h3>系统寄存器</h3>
+
+  <table>
+    <tr><th>寄存器</th><th>编码</th><th>功能</th></tr>
+    <tr><td><code>VBAR_EL0_FDT</code></td><td><code>S3_3_C11_C1_0</code></td><td>SVC 重定向入口地址（<strong>per-process</strong>）。应用 SVC 时 PC 跳转到此。</td></tr>
+    <tr><td><code>ELR_EL0</code></td><td>标准 ELR</td><td>SVC 指令下一条地址（SVC+4）。Handler 执行 <code>ERET</code> 时恢复 PC。</td></tr>
+    <tr><td><code>SPSR_EL0</code></td><td>标准 SPSR</td><td>SVC 执行时的 PSTATE。ERET 时恢复。</td></tr>
+    <tr><td><code>Tindex_EL0</code></td><td>-</td><td>线程索引，handler 快速定位 per-thread 结构。</td></tr>
+  </table>
+
+  <div class="highlight-box">
+    <strong>VBAR_EL0_FDT 访问方式（汇编）：</strong><br>
+    <code>MSR S3_3_C11_C1_0, Xn</code> — 写入入口地址<br>
+    <code>MRS Xn, S3_3_C11_C1_0</code> — 读取当前入口
+  </div>
+
+  <h3>内核 prctl 接口</h3>
+
+  <table>
+    <tr><th>调用</th><th>功能</th></tr>
+    <tr><td><code>prctl(71, 1)</code></td><td>开启 FEAT_FGT 快速跳转功能</td></tr>
+    <tr><td><code>prctl(71, 0)</code></td><td>关闭 FEAT_FGT 快速跳转功能</td></tr>
+  </table>
+
+  <div class="highlight-box">
+    <strong>使能粒度（内核语义）：</strong>VBAR_EL0_FDT 写入与 <code>prctl(71, 1/0)</code> 使能均按 <strong>进程</strong> 粒度生效。同一进程内所有线程共享同一重定向入口与使能状态。进程 fork 出的子进程拥有独立的 VBAR_EL0_FDT 与使能状态，<strong>需在子进程中重新配置</strong>。
+  </div>
+
+  <h3>行为特征</h3>
+
+  <div class="grid-2">
+    <div class="card-mini">
+      <h4>🔀 SVC 重定向</h4>
+      <p>应用 SVC → PC = VBAR_EL0_FDT。寄存器内容（X0-X5 参数、X8 sysno）<strong>原样保留</strong>。无 EL0→EL1 异常。</p>
+    </div>
+    <div class="card-mini">
+      <h4>🔒 嵌套 SVC 保护</h4>
+      <p>进入 handler 时硬件自动清除 FEAT_FGT 使能位。Handler 内 SVC 正常走 EL0→EL1→seccomp，不递归。</p>
+    </div>
+    <div class="card-mini">
+      <h4>📋 Per-Process 使能</h4>
+      <p>VBAR_EL0_FDT 与 prctl(71) 均为进程粒度，进程内所有线程共享同一入口。</p>
+    </div>
+    <div class="card-mini">
+      <h4>↩️ ERET 返回</h4>
+      <p>Handler 通过 <code>ERET</code> 返回：PC ← ELR_EL0，PSTATE ← SPSR_EL0。无 sigreturn。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 2. 当前路径 ==================== -->
+<div class="section" id="s2">
+  <h2>2. 当前 Systrap Syscall 路径</h2>
+
+  <div class="diagram">应用 SVC
+  → EL0→EL1 异常 → seccomp BPF 过滤
+  → SIGSYS 信号投递（内核构建 ucontext：31 regs + fpsimd + siginfo）
+  → __export_sighandler():
+      保存 ucontext → switch_context() FUTEX_WAKE sentry
+      get_context() 等待处理
+  → sentry 处理 syscall
+  → restore_state() → sigreturn → 应用恢复执行</div>
+
+  <p><strong>本设计的目标</strong>：在现有路径前端插入 FEAT_FGT 跳转层，改造 SVC 指令的跳转行为，使其先进入 EL0 handler 再转发给内核。现有 seccomp+SIGSYS 处理逻辑<b>完全复用</b>。</p>
+</div>
+
+<!-- ==================== 3. 使能机制 ==================== -->
+<div class="section" id="s3">
+  <h2>3. 使能机制（动态开关）</h2>
+
+  <p>gvisor 提供运行时开关，动态使能/去使能 FEAT_FGT。使能时：配置 VBAR_EL0_FDT 为一个<b>统一的跳转入口</b>，然后全局使能 FEAT_FGT。去使能时：关闭 FEAT_FGT。</p>
+
+  <h3>3.1 使能流程（per-process）</h3>
+
+  <p>gvisor 中应用运行在 <strong>stub 子进程</strong>中。由于内核按进程粒度使能 FEAT_FGT，配置与使能动作必须在 <strong>每个 stub 子进程</strong>上下文中执行（sentry 进程自身不需要使能）。</p>
+
+  <pre>每个 stub 子进程初始化:
+  ① 写入 SYS_VBAR_EL0_FDT ← fdt_handler 地址（统一跳转入口）
+       MSR S3_3_C11_C1_0, Xn
+  ② prctl(71, 1)         ← 使能 FEAT_FGT（per-process）
+  ③ 打印使能日志
+
+运行中动态关闭（per-process）:
+  ① prctl(71, 0)         ← 关闭 FEAT_FGT（per-process）
+  ② 打印去使能日志</pre>
+
+  <div class="highlight-box">
+    <strong>多进程注意：</strong>每个 stub 子进程都需独立执行 ① 写入 + ② 使能。fork 出的新 stub 子进程（如多容器/多 app 场景）会继承父进程状态，但进程独立后需各自配置。若未来支持进程内 fork 应用，子进程需重新注册。
+  </div>
+
+  <h3>3.2 gvisor 侧开关设计</h3>
+
+  <table>
+    <tr><th>方式</th><th>说明</th></tr>
+    <tr><td>runsc 启动参数</td><td>新增 <code>--feat-fgt</code> flag，systrap 平台创建每个 stub 子进程时使能</td></tr>
+    <tr><td>运行时 sysctl</td><td>新增 sentry 侧 sysctl 节点，运行中可动态 <code>1/0</code> 切换；切换时对所有 stub 子进程广播执行 prctl(71, 1/0)</td></tr>
+  </table>
+
+  <div class="highlight-box">
+    <strong>实现约束：</strong>VBAR_EL0_FDT 是 per-process 寄存器，只能在 <strong>stub 子进程</strong>上下文中写入（sentry 不能直接写其他进程的 VBAR_EL0_FDT）。通过在 stub 汇编中新增配置函数，由 sentry 通过 stub 寄存器调用机制触发执行。
+  </div>
+</div>
+
+<!-- ==================== 4. 跳转入口（Handler）设计 ==================== -->
+<div class="section" id="s4">
+  <h2>4. 跳转入口（Handler）设计</h2>
+
+  <p>Handler 是一个 <strong>SVC 转发器</strong>：保存 X0~X30 到栈 → 按原始系统调用号重新执行 SVC（正常陷入内核，走现有 seccomp+SIGSYS 路径）→ 恢复栈 → ERET 返回应用。</p>
+
+  <h3>4.1 执行流程</h3>
+
+  <div class="diagram">应用 SVC #NR（X0-X5=args, X8=NR）
+  │
+  ▼ FEAT_FGT 重定向（PC ← VBAR_EL0_FDT, ELR_EL0 ← SVC+4）
+  ┌──────────────────────────────────────┐
+  │ __export_fdt_handler (EL0):           │
+  │  ① 保存 X0~X30 到栈（不修改寄存器值）  │
+  │  ② 日志计数 +1（共享内存计数器）       │
+  │  ③ SVC #0（X8=原始 NR 原样保留）       │
+  │      └→ EL0→EL1 → seccomp → SIGSYS   │
+  │         → __export_sighandler → sentry│
+  │         → sigreturn（X0=返回值）       │
+  │  ④ 恢复栈（SP += 保存区大小）          │
+  │  ⑤ ERET（PC ← ELR_EL0, PSTATE ← SPSR_EL0）│
+  └──────────────────────────────────────┘
+  │
+  ▼ 应用恢复执行（SVC 下一条指令，X0=返回值）</div>
+
+  <h3>4.2 Handler 汇编</h3>
+
+  <pre>TEXT __export_fdt_handler(SB),NOSPLIT,$0
+    // ① 保存 X0~X30 到栈（STP 只读寄存器写内存，不改变寄存器值）
+    STP X0,  X1,  [SP, #-16]!
+    STP X2,  X3,  [SP, #-16]!
+    STP X4,  X5,  [SP, #-16]!
+    STP X6,  X7,  [SP, #-16]!
+    STP X8,  X9,  [SP, #-16]!      // X8 = syscall number
+    STP X10, X11, [SP, #-16]!
+    STP X12, X13, [SP, #-16]!
+    STP X14, X15, [SP, #-16]!
+    STP X16, X17, [SP, #-16]!
+    STP X18, X19, [SP, #-16]!
+    STP X20, X21, [SP, #-16]!
+    STP X22, X23, [SP, #-16]!
+    STP X24, X25, [SP, #-16]!
+    STP X26, X27, [SP, #-16]!
+    STP X28, X29, [SP, #-16]!
+    STP X30, X30, [SP, #-16]!      // LR
+
+    // ② 日志计数（跳转计数器 +1）
+    MOVD $fdt_jump_count_addr(SB), X9
+    MOVD (X9), X10
+    ADD  $1, X10
+    MOVD X10, (X9)
+
+    // ③ 转发：SVC（此时 X0-X5, X8 仍为原始 syscall 参数）
+    //    进入 handler 时 FEAT_FGT 已硬件关闭 → 正常 EL0→EL1 → seccomp → SIGSYS
+    SVC #0
+    //    sigreturn 后返回此处，X0 = syscall 返回值，其余寄存器保持不变
+
+    // ④ 恢复栈（寄存器已是处理后的结果，不从栈覆盖）
+    ADD SP, SP, #(16*16)
+
+    // ⑤ ERET：PC ← ELR_EL0, PSTATE ← SPSR_EL0
+    ERET()</pre>
+
+  <h3>4.3 关键说明</h3>
+
+  <table>
+    <tr><th>要点</th><th>说明</th></tr>
+    <tr><td>参数透传</td><td>STP 不修改寄存器值，SVC 时 X0-X5、X8 保持应用原值，syscall 参数零拷贝透传给内核。</td></tr>
+    <tr><td>寄存器恢复</td><td>SVC 返回（sigreturn）后寄存器已是处理结果，故 <b>只恢复 SP</b>，不从栈覆盖 X0~X30。</td></tr>
+    <tr><td>嵌套 SVC</td><td>handler 内的 SVC 正常走 EL0→EL1→seccomp→SIGSYS，FEAT_FGT 已硬件关闭，不递归。</td></tr>
+    <tr><td>seccomp 不变</td><td>转发的 SVC 仍被 seccomp 拦截为 SIGSYS，现有 sighandler 路径<b>无需修改</b>。</td></tr>
+  </table>
+</div>
+
+<!-- ==================== 5. 日志设计 ==================== -->
+<div class="section" id="s5">
+  <h2>5. 日志设计</h2>
+
+  <p>目标：观察 FEAT_FGT 的使能状态，以及 SVC 指令跳转行为被改变。</p>
+
+  <h3>5.1 使能/去使能日志（sentry Go 侧）</h3>
+
+  <pre>FEAT_FGT enabled: VBAR_EL0_FDT=0x0000xxxx, prctl(71,1) OK
+FEAT_FGT disabled: prctl(71,0) OK</pre>
+
+  <p>使用 gvisor <code>log.Infof</code>，在使能/去使能时打印入口地址与 prctl 返回值。</p>
+
+  <h3>5.2 跳转行为日志（handler 侧）</h3>
+
+  <p>Handler 每跳转一次递增共享内存计数器，sentry 侧读取并周期性打印，以证明 SVC 已被重定向到指定入口：</p>
+
+  <pre>// stub 地址空间共享内存新增字段:
+struct fdt_log {
+  uint64_t jump_count;   // SVC 跳转次数
+  uint64_t last_sysno;   // 最近一次 syscall number (X8)
+};
+
+// handler 侧: 每次跳转 +1, 记录 sysno（见 4.2 节 ②）
+// sentry 侧: 周期读取并打印
+FEAT_FGT handler: jump_count=1000, last_sysno=172 (getpid)</pre>
+
+  <div class="highlight-box">
+    <strong>对比观测：</strong>
+    <ul style="margin: 6px 0 0 20px;">
+      <li><b>使能前</b>：应用 SVC 直接 EL0→EL1，日志无 handler 记录</li>
+      <li><b>使能后</b>：应用 SVC 跳转到 handler，jump_count 持续增长</li>
+      <li>通过 jump_count 是否增长，直接验证 SVC 跳转行为已被 FEAT_FGT 改变</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ==================== 6. 代码修改清单 ==================== -->
+<div class="section" id="s6">
+  <h2>6. 代码修改清单</h2>
+
+  <ul class="file-list">
+    <li><span class="new">+</span> <code>pkg/sentry/platform/systrap/sysmsg/fdt_handler_arm64.S</code>
+    <br>FEAT_FGT 跳转入口汇编（保存 X0~X30 → SVC 转发 → 恢复 SP → ERET）</li>
+
+    <li><span class="new">+</span> <code>pkg/sentry/platform/systrap/fdt.go</code>
+    <br>FEAT_FGT 使能/去使能管理逻辑（Enable/Disable + 日志）</li>
+
+    <li><span class="mod">M</span> <code>pkg/sentry/platform/systrap/stub_unsafe.go</code>
+    <br>stubInit：嵌入 fdt_handler blob 到 stub 地址空间；映射 fdt_log 共享内存</li>
+
+    <li><span class="mod">M</span> <code>pkg/sentry/platform/systrap/subprocess.go</code>
+    <br>stub 进程初始化：写入 VBAR_EL0_FDT（MSR S3_3_C11_C1_0）→ prctl(71,1)</li>
+
+    <li><span class="mod">M</span> <code>pkg/sentry/platform/systrap/subprocess_arm64.go</code>
+    <br>ARM64 寄存器写 VBAR_EL0_FDT 的实现（stub 寄存器调用）</li>
+
+    <li><span class="mod">M</span> <code>pkg/sentry/platform/systrap/sysmsg/sysmsg.h</code>
+    <br>新增 <code>struct fdt_log</code> 共享内存字段（jump_count / last_sysno）</li>
+
+    <li><span class="mod">M</span> <code>pkg/sentry/platform/systrap/sysmsg/sysmsg.go</code>
+    <br>同步 Go 侧 fdt_log 结构</li>
+
+    <li><span class="mod">M</span> <code>runsc/config</code> 相关
+    <br>新增 <code>--feat-fgt</code> 启动开关</li>
+  </ul>
+</div>
+
+<!-- ==================== 7. 验证方案 ==================== -->
+<div class="section" id="s7">
+  <h2>7. 验证方案</h2>
+
+  <p>QEMU TCG 模式 + syscallbench 工具。</p>
+
+  <h3>7.1 跳转行为验证（日志观测）</h3>
+
+  <pre># 使能 FEAT_FGT 后运行:
+./syscallbench -l 1000000 -s 0   # getpid
+
+# 预期日志:
+FEAT_FGT enabled: VBAR_EL0_FDT=0x0000xxxx, prctl(71,1) OK
+FEAT_FGT handler: jump_count=1, last_sysno=172
+FEAT_FGT handler: jump_count=2, last_sysno=172
+...
+# jump_count 随 syscall 数持续增长 = SVC 跳转行为已改变 ✓</pre>
+
+  <h3>7.2 功能正确性验证</h3>
+
+  <div class="grid-2">
+    <div class="card-mini">
+      <h4>✅ syscall 返回值正确</h4>
+      <p>getpid 返回正确 PID，write 写入成功</p>
+    </div>
+    <div class="card-mini">
+      <h4>✅ 去使能恢复</h4>
+      <p>prctl(71,0) 后 SVC 恢复原路径，jump_count 停止增长</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 8. 风险 ==================== -->
+<div class="section" id="s8">
+  <h2>8. 风险</h2>
+
+  <table>
+    <tr><th>#</th><th>风险项</th><th>缓解</th></tr>
+    <tr>
+      <td>1</td>
+      <td>FEAT_FGT 与 seccomp 执行顺序：若 seccomp 先于 FEAT_FGT 拦截，应用 SVC 不跳转 handler</td>
+      <td>验证阶段观察 jump_count 是否增长；确认硬件翻译 SVC 时先检查 VBAR_EL0_FDT</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>per-process 粒度：每个 stub 子进程都必须独立写入 VBAR_EL0_FDT + prctl(71,1)，多进程/多容器场景配置遗漏</td>
+      <td>配置逻辑封装在 stub 初始化入口，所有 stub 子进程统一执行；fork 后显式重新注册</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>handler 内 SVC 转发时被信号（SIGCHLD）打断</td>
+      <td>保留现有 SIGCHLD 处理，futex(FUTEX_WAIT) 可被信号打断</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>每次 syscall 多一次栈保存/恢复（16 对 STP + SP 恢复）开销</td>
+      <td>本阶段目标是<b>验证跳转行为</b>；性能优化是后续阶段（handler 直接与 sentry 通信）</td>
+    </tr>
+  </table>
+
+  <div class="highlight-box">
+    <strong>本阶段定位：</strong>先通过 SVC 转发器方案验证 FEAT_FGT 跳转行为被正确改变（日志观测），复用现有 systrap 处理路径，风险最小。性能优化（跳过 seccomp/信号，handler 直连共享内存）作为后续迭代。
+  </div>
+</div>
+
+<div class="footer">
+  <p>gVisor FEAT_FGT Enabling Design &mdash; v4.0</p>
+  <p>Author: Zou Yipeng &middot; zouyipeng@huawei.com</p>
+  <p style="margin-top: 6px; font-size: 0.85em;">Scope: ARM64 Systrap Platform &middot; QEMU TCG Verification</p>
+</div>
+
+</div>
+</body>
+</html>

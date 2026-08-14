@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARM64 FEAT_FGT 实现 syshandler（fast path）设计方案</title>
+<style>
+  :root {
+    --fg: #1f2328;
+    --muted: #59636e;
+    --border: #d0d7de;
+    --accent: #0969da;
+    --bg-code: #f6f8fa;
+    --bg-head: #f6f8fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Helvetica, Arial, sans-serif;
+    color: var(--fg);
+    line-height: 1.7;
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+    background: #fff;
+  }
+  h1 { font-size: 1.9em; border-bottom: 1px solid var(--border); padding-bottom: .35em; margin-top: 0; }
+  h2 { font-size: 1.4em; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
+  h3 { font-size: 1.15em; margin-top: 1.6em; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+    font-size: .88em;
+    background: var(--bg-code);
+    border-radius: 4px;
+    padding: .15em .4em;
+  }
+  pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: .86em; }
+  blockquote {
+    margin: 1em 0;
+    padding: .4em 1em;
+    color: var(--muted);
+    border-left: 4px solid var(--border);
+    background: #fbfcfd;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; font-size: .95em; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--bg-head); font-weight: 600; }
+  tr:nth-child(even) td { background: #fbfcfd; }
+  ul, ol { padding-left: 1.6em; }
+  li { margin: .3em 0; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+  .muted { color: var(--muted); }
+  .tag { display: inline-block; font-size: .72em; font-weight: 600; padding: 1px 8px; border-radius: 999px; margin-right: 6px; vertical-align: middle; }
+  .tag-ok { background: #dafbe1; color: #116329; }
+  .tag-warn { background: #fff8c5; color: #7d4e00; }
+</style>
+</head>
+<body>
+
+<h1>ARM64 FEAT_FGT 实现 syshandler（fast path）设计方案</h1>
+
+<blockquote>
+  <strong>目标</strong>：用 ARM64 上的 FEAT_FGT（SVC 重定向）复刻 AMD64 上 systrap 的「syscall patching」
+  fast path，消除信号帧 / rt_sigreturn / seccomp 的开销。<br>
+  前置理解见 <code>syshandler-amd64-flow.md</code>。
+</blockquote>
+
+<hr>
+
+<h2>0. 一句话结论（AMD64 → ARM64 映射）</h2>
+
+<table>
+  <thead>
+    <tr><th>AMD64 syshandler</th><th>ARM64 FEAT_FGT</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>入口重定向：二进制 patch <code>mov+syscall</code> → <code>jmp *trap</code></td>
+        <td>FGT 硬件：<code>svc</code> → <code>VBAR_EL0_FGT</code>（不陷 EL1）</td></tr>
+    <tr><td><strong>per-thread 身份：<code>%gs</code> 段基址</strong></td>
+        <td><strong>per-thread VBAR_EL0 → per-thread 入口 stub（把 sysmsg 指针烤进 stub）</strong></td></tr>
+    <tr><td>私有栈切换：trampoline 里 <code>mov %gs:msg.SyshandlerStack, %rsp</code></td>
+        <td>stub 里 <code>ldr x16,[x18,#syshandler_stack]; mov sp,x16</code></td></tr>
+    <tr><td>返回：<code>jmp *msg-&gt;ret_addr</code>（全程 EL0）</td>
+        <td><code>eret</code>（写 ELR_EL0 / SPSR_EL0）</td></tr>
+    <tr><td>寄存器保存：<code>prepare_enter_syshandler</code> 写 ptregs</td>
+        <td>汇编 stp 写 <code>ctx-&gt;ptregs</code>（arm64 布局 regs[0..30]/sp/pc/pstate）</td></tr>
+    <tr><td>FP：<code>xsaveopt</code></td>
+        <td>手动 stp q0-q31 + fpsr/fpcr（首版不含 SVE）</td></tr>
+    <tr><td>中断协调：PREP/NONE + <code>ctx-&gt;interrupt</code></td>
+        <td>移植同一套（sighandler_arm64.c 需补）</td></tr>
+  </tbody>
+</table>
+
+<p><strong>核心洞察</strong>：VBAR_EL0 按线程粒度维护——这正好补上 ARM64 缺的那一半。
+<code>%gs</code> 基址 = 每个线程一份、指向该线程的 <code>struct sysmsg</code>；ARM64 上用 <strong>per-thread 入口 stub</strong>
+（每个线程的 VBAR 指向自己那份 stub，stub 里烤进该线程的 sysmsg 地址）做等价物。
+<strong>其余（保存/恢复寄存器、switch_context、中断舞步、返回）都是可移植的机械活。</strong></p>
+
+<hr>
+
+<h2>1. 内核语义（已确认）</h2>
+
+<ol>
+  <li><strong>(P1)</strong> <code>prctl(71, 1, addr)</code> 设置<strong>调用线程</strong>的 VBAR_EL0_FGT = <code>addr</code>（按线程维护），
+    <code>addr</code> 需 4KB 对齐。（现有 <code>fgt.go</code> 已按此调用。）</li>
+  <li><strong>(P2)</strong> FGT 使能后，<code>svc</code> 在 EL0 直接跳到 <code>VBAR_EL0_FGT</code>；硬件保存
+    <code>ELR_EL0</code>=返回 PC、<code>SPSR_EL0</code>=guest PSTATE，<strong>x0-x30 与 SP 原样保留</strong>（SP=SP_EL0=guest SP）。</li>
+  <li><strong>(P3)</strong> 进入 handler 时 FGT <strong>自动关闭</strong>：handler 内的 <code>svc</code>（如 switch_context 里的
+    futex）走正常 EL0→EL1 路径（现有 forwarder 注释已确认）。</li>
+  <li><span class="tag tag-ok">已确认 R1</span>返回时 FGT <strong>仅在 ERET 重新使能</strong>（<code>br</code> 不重新使能）→ 返回必须用
+    <code>eret</code>（写 <code>elr_el0</code>/<code>spsr_el0</code> 后 eret），不用 <code>br</code>。</li>
+  <li><span class="tag tag-ok">已确认 R2</span><code>ELR_EL0</code> / <code>SPSR_EL0</code> 在 EL0 可用 <code>mrs</code>/<code>msr</code> 读写
+    （<code>msr elr_el0</code> / <code>msr spsr_el0</code> 均可）；<code>eret</code> 时 PC/PSTATE 由硬件从二者恢复，无需软件恢复。</li>
+  <li><strong>(R3，已确认)</strong> 全量保存/恢复 x0-x30（含 x18，不依赖「guest 不用 x18」）：<code>x18</code> 兼作
+    handler 的 sysmsg 基址，stub 进入时先把 guest 的原始 x18 压到私有栈、handler 内读入
+    <code>ptregs.regs[18]</code>，返回前统一恢复；<code>x16/x17</code> 作 stub 引导 scratch。</li>
+</ol>
+
+<hr>
+
+<h2>2. 核心机制：per-thread 入口 stub = <code>%gs</code> 的等价物</h2>
+
+<p>每个 sysmsg 线程新增 <strong>一页 4KB RX 的「FGT 入口 stub」</strong>，VBAR_EL0 指向它。
+stub 是固定字节模板，创建线程时<strong>把该线程的 <code>sysmsg</code> 地址烤进 movz/movk 立即数</strong>
+（与 AMD64 trampoline 把 ret_addr/sysno 烤进模板同一种手法）。</p>
+
+<pre><code>（每个线程）                                  （共享，sysmsg blob 内）
+┌─────────────────┐  VBAR_EL0 ──► ┌──────────────────────┐
+│ per-thread stub │               │ __export_fgt_handler │
+│  (4KB, RX)      │               │  (save/restore +     │
+│  sysmsg ptr 烤入 │ ──br x16──►  │   call __syshandler) │
+└─────────────────┘               └──────────────────────┘</code></pre>
+
+<p>stub 伪汇编（每线程一份，<code>#sysmsg</code> 为烤入值）：</p>
+
+<pre><code>movz x18, #lo16(sysmsg) ; movk x18,#hi(sysmsg),lsl#16 ; movk x18,#hi2,lsl#32 ; movk x18,#hi3,lsl#48
+mov  x16, sp                        ; 存 guest SP
+str  x16, [x18, #offsetof_sysmsg_app_stack]
+ldr  x16, [x18, #offsetof_sysmsg_syshandler_stack]
+mov  sp, x16                        ; 切到 per-thread 私有 syshandler 栈
+ldr  x16, [x18, #offsetof_sysmsg_syshandler]   ; = __export_fgt_handler 地址
+br   x16</code></pre>
+
+<ul>
+  <li><strong>x18 就是 <code>%gs</code> 基址的角色</strong>（永远指向当前线程的 sysmsg），handler 全程用它 <code>[x18,#off]</code>
+    访问 sysmsg 字段，与 AMD64 的 <code>%gs:msg.*</code> 一一对应。</li>
+  <li>stub 与 sysmsg 结构分离（stub 在 RX 页，sysmsg 在 RW 页），<strong>避免 W^X</strong>，与 AMD64 把
+    trampoline(可执行) 与 sysmsg(可写) 分开保持一致。</li>
+  <li><code>sysmsg-&gt;syshandler</code> 字段复用：FGT 使能时指向 <code>__export_fgt_handler</code>（见 §4.2）。</li>
+</ul>
+
+<hr>
+
+<h2>2.1 线程切换与 VBAR / guest context 的区分</h2>
+
+<p><strong>结论：gVisor 内部的 context 切换不需要切换 VBAR，也不靠 VBAR 区分 guest context。</strong></p>
+
+<h3>2.1.1 两种「切换」，只有一种涉及 VBAR</h3>
+
+<table>
+  <tr><th>切换</th><th>执行者</th><th>是否动 VBAR</th></tr>
+  <tr><td>层 A：host 内核调度器在两个 sysmsg 线程（两个真实 Linux task）之间切换</td><td>内核</td><td>是，内核按 task 保存/恢复 VBAR_EL0_FGT（§1 P1）</td></tr>
+  <tr><td>层 B：gVisor <code>switch_context()</code> 换 guest context（<code>sysmsg_lib.c:382</code>）</td><td>同一 host 线程内的 C 代码</td><td>否，host 线程没变</td></tr>
+</table>
+
+<ul>
+  <li>每个 sysmsg 线程 = 一个真实 host Linux task（<code>createSysmsgThread()</code> → <code>ptraceThread.clone()</code>，
+    <code>subprocess.go:256</code>/<code>:1071</code>）。VBAR_EL0_FGT 是它的寄存器状态，随内核调度保存/恢复。</li>
+  <li><code>switch_context()</code> 只是把「当前 host 线程服务的 guest 上下文」从 A 换成 B：标旧 ctx 完成 →
+    <code>get_context()</code> 取下一个 ctx → 恢复其寄存器 → <code>eret</code>。全程不换 host 线程。</li>
+</ul>
+
+<h3>2.1.2 sysmsg 线程是「池」，M:N 映射到 guest 线程</h3>
+
+<p>不是 1:1。<code>sysmsgThreads map[uint32]*sysmsgThread</code>（<code>subprocess.go:169</code>）+ <code>maxSysmsgThreads</code>
+是一个池，<code>kickSysmsgThread()</code> 按需增删（<code>subprocess.go:971</code>）。<code>thread_context</code> 有
+<code>thread_id</code> / <code>last_thread_id</code> 字段（<code>sysmsg_lib.c:389-390</code>），<code>switch_context</code> 把它们写成
+<code>INVALID_THREAD_ID</code> / <code>sysmsg-&gt;thread_id</code>，正是为了追踪「该 guest ctx 上次被哪个 sysmsg
+线程跑过」。→ <strong>身份必须绑在 host sysmsg 线程上，而不是 guest 线程上。</strong></p>
+
+<h3>2.1.3 区分 guest context：两级指针，一级静态、一级动态</h3>
+
+<pre><code>SVC ──► VBAR_EL0_FGT ──► per-thread stub ──► x18 = sysmsg ──► sysmsg-&gt;context ──► thread_context
+        (内核按 host 线程维护)   (烤死的指针，创建后不变)        (每次 get_context 改写)
+                                    └ 回答「哪个 host 线程」          └ 回答「哪个 guest context」</code></pre>
+
+<ul>
+  <li><strong>第一级 <code>x18 → sysmsg</code></strong>：烤进 stub 的立即数，创建后不变，回答「跑在哪个 host sysmsg 线程上」。</li>
+  <li><strong>第二级 <code>sysmsg-&gt;context</code></strong>：可变指针，回答「该 host 线程此刻正服务哪个 guest context」。</li>
+</ul>
+
+<p><strong>无歧义的原因</strong>：一个 host sysmsg 线程任意时刻只跑一个 guest context（单控制流），且
+<code>sysmsg-&gt;context</code> 在 guest 代码开跑之前就被绑定——<code>queue_get_context()</code> 弹出 ctx 后第一件事
+就是 <code>sysmsg-&gt;context = ctx</code>（<code>sysmsg_lib.c:241</code>），之后才恢复寄存器、<code>eret</code> 进 guest。于是
+guest 后续 <code>SVC</code> 进 handler 时，<code>[x18,#context]</code> 读到的必然就是当前这个 ctx；只有下一次
+<code>switch_context()</code>（必然发生在 trap 边界）才会改写它，且同时同步恢复下一个 ctx 的寄存器。
+指针与寄存器状态在同一条路径、同一个边界一起换，永不错位。</p>
+
+<h3>2.1.4 与 AMD64 对照</h3>
+
+<p>AMD64 fast path 取 context（<code>syshandler_amd64.S:46</code>）：</p>
+
+<pre><code>movq %gs:offsetof_sysmsg_context, %rcx   ; %gs → sysmsg → context</code></pre>
+
+<p>ARM64 等价于：</p>
+
+<pre><code>ldr  x16, [x18, #offsetof_sysmsg_context] ; x18 → sysmsg → context</code></pre>
+
+<p><code>%gs</code>（amd64）与 <code>x18</code>（arm64，由 stub 烤入）角色完全相同；「跑哪个 guest context」在两者上
+都由 <code>sysmsg-&gt;context</code> 回答，该字段与 <code>get_context/switch_context</code> 协议是架构无关 C 代码，
+arm64 直接复用，无需额外机制。</p>
+
+<h3>2.1.5 对 handler 的印证</h3>
+
+<p>handler 进入时必须<strong>每次现读 <code>[x18, #context]</code>，不能缓存</strong>（方案 §3.2 第 2 步正是 <code>ldr x16,
+[x18, #context]</code>），因为同一 sysmsg 线程服务下一个 guest ctx 时该字段已被改写。</p>
+
+<hr>
+
+<h2>3. Fast path 完整流程</h2>
+
+<h3>3.1 入口（stub，见 §2）</h3>
+<p>置 x18=sysmsg、存 guest SP 到 <code>sysmsg-&gt;app_stack</code>、切私有栈、<code>br</code> 进共享 handler。</p>
+
+<h3>3.2 共享 handler <code>__export_fgt_handler</code>（替换现在的 forwarder）</h3>
+
+<pre><code>1. str  w16, [x18, #state]  = THREAD_STATE_PREP        ; 推迟中断
+2. ldr  x16, [x18, #context]                            ; ctx = sysmsg-&gt;context
+3. 存 guest SP/PC/PSTATE：
+     ldr x17,[x18,#app_stack]  → ctx-&gt;ptregs.sp
+     mrs x17,elr_el0           → ctx-&gt;ptregs.pc  (同时写 sysmsg-&gt;ret_addr)
+     mrs x17,spsr_el0          → ctx-&gt;ptregs.pstate
+4. stp 存 x0..x30 → ctx-&gt;ptregs.regs[0..30]（全量保存；x18 的 guest 值由 stub 先压私有栈，此处读回 regs[18]）
+5. 存 FP：stp q0..q31 + fpsr/fpcr → ctx-&gt;fpstate（SVE 见 §4.5）
+6. ctx-&gt;signo = SIGSYS；ctx-&gt;siginfo.si_syscall = x8；
+   ctx-&gt;ptregs.regs[0] = -ENOSYS；ctx-&gt;tls = mrs tpidr_el0
+7. call __syshandler        ; C：switch_context(SYSCALL_TRAP) + 中断舞步（§3.3）
+8. 恢复新 ctx：FP(若 fpstate_changed)、x0..x30、tpidr_el0、NZCV
+9. 返回：msr elr_el0, ctx-&gt;pc ; msr spsr_el0, ctx-&gt;pstate ; eret</code></pre>
+
+<h3>3.3 <code>__syshandler</code>（新增 C，移植 AMD64 <code>sighandler_amd64.c:353-381</code> + <code>:166-197</code>）</h3>
+<p>与 <code>__export_sighandler</code> 的差异只有两点：</p>
+<ul>
+  <li>context state 用 <strong><code>CONTEXT_STATE_SYSCALL_TRAP</code></strong>（而非 <code>SYSCALL</code>），sentry 据此区分
+    "来自 fast path" 与 "来自信号路径"（对应 AMD64 的 <code>__syshandler</code>）。</li>
+  <li>加 <strong>PREP/NONE + <code>ctx-&gt;interrupt</code> 中断舞步</strong>（<code>switch_context_amd64</code> 那段 for 循环）：
+    <code>switch_context</code> 出来后置 <code>THREAD_STATE_NONE</code>，若 <code>ctx-&gt;interrupt</code> 被置位则再 switch 一次
+    把 FAULT 还给 sentry。</li>
+</ul>
+
+<h3>3.4 返回路径（已定：ERET）</h3>
+<ul>
+  <li><strong>ERET</strong>：<code>msr elr_el0, ctx-&gt;pc ; msr spsr_el0, ctx-&gt;pstate ; eret</code>。
+    FGT 只在 ERET 重新使能（§1 R1），因此返回必须走 ERET，不用 <code>br</code>。</li>
+  <li><code>ELR_EL0</code>/<code>SPSR_EL0</code> 在 EL0 可用 <code>msr</code> 写（§1 R2，已确认）；<code>eret</code> 由硬件恢复 PC/PSTATE。</li>
+</ul>
+
+<p><strong>全程无信号帧、无 rt_sigreturn、无 seccomp</strong> —— 与 AMD64 一样，只是入口/出口换成
+SVC/ERET，中间是同一套 switch_context。</p>
+
+<hr>
+
+<h2>3.5 完整系统调用时序（具体到线程与函数）</h2>
+
+<p>下面把「guest 发一次 <code>svc</code> 到拿到返回值」的完整闭环拆成三条泳道，标注每一步落在
+<strong>哪个线程、哪个函数</strong>。注意：guest 代码本身就跑在 sysmsg 线程上（EL0），所以三条泳道分别是
+<strong>guest（EL0 执行流）</strong>、<strong>sysmsg 线程（host task，含 stub/handler/switch_context）</strong>、
+<strong>sentry（goroutine，平台主循环）</strong>。三者通过共享内存里的 <code>context_queue</code> + futex 通信。</p>
+
+<pre><code>
+ guest (EL0, 跑在 sysmsg 线程上)      sysmsg 线程 (host task)               sentry (goroutine)
+        │                                  │                                  │
+  ①  svc #0                               │                                  │
+        │── 硬件 FGT 重定向 VBAR_EL0_FGT ──>│                                  │
+        │                                  │ __export_fgt_stub                │
+        │                                  │  x18=sysmsg, 存 guest SP→app_stack│
+        │                                  │  切私有 syshandler 栈             │
+        │                                  │ __export_fgt_handler              │
+        │                                  │  保存 x0..x30/FP → ctx->ptregs    │
+        │                                  │ __syshandler()                    │
+        │                                  │  signo=SIGSYS, si_syscall=x8      │
+        │                                  │ switch_context_arm64()            │
+        │                                  │  └ switch_context(SYSCALL_TRAP)   │
+        │                                  │     ├─ ctx.state=SYSCALL_TRAP     │
+        │                                  │     └─ futex(FUTEX_WAKE) ────────>│  waitOnState() 被唤醒
+        │                                  │     get_context() 阻塞(futex wait) │  switchToApp() 返回
+        │                                  │                                  │   isSyscall=true
+        │                                  │                                  │  Switch() 返回平台循环
+        │                                  │                                  │  sentry 执行 syscall(x8=号)
+        │                                  │                                  │  返回值写 ac.Regs[0]
+        │                                  │                                  │  Switch() 再次调用
+        │                                  │                                  │  switchToApp()
+        │                                  │                                  │   contextQueue.add(ctx)
+        │                                  │                                  │   waitOnState() 阻塞
+        │                                  │<──── futex wake / 队列弹出 ctx ────│
+        │                                  │ get_context() 返回新 ctx           │
+        │                                  │ 恢复 x0..x30 (x0=返回值)           │
+        │                                  │ msr ELR_EL0/SPSR_EL0, mov sp      │
+        │<────── eret（重新使能 FGT）──────│                                  │
+  ②  从 svc 下一条指令继续跑，x0 已是返回值 │                                  │
+</code></pre>
+
+<p>关键点（对应源码）：</p>
+<ol>
+  <li><strong>sentry 侧调用链</strong>：<code>platformContext.Switch()</code>（<code>systrap.go:172</code>）
+    → <code>subprocess.switchToApp()</code>（<code>subprocess.go:812</code>）
+    → <code>contextQueue.add()</code> + <code>waitOnState()</code>（<code>subprocess.go:840/844</code>）；
+    收到 <code>isSyscall=true</code> 后返回给 sentry 平台循环去真正执行 syscall，再二次 <code>Switch()</code> 交还结果。</li>
+  <li><strong>sysmsg 线程侧</strong>：<code>__export_fgt_stub</code>（<code>fgt_stub_arm64.S:43</code>）→
+    <code>__export_fgt_handler</code>（<code>fgt_handler_arm64.S:53</code>）→ <code>__syshandler</code>
+    （<code>sighandler_arm64.c:270</code>）→ <code>switch_context_arm64</code>（<code>sighandler_arm64.c:234</code>）
+    → <code>switch_context</code>（<code>sysmsg_lib.c:382</code>，架构无关）→ <code>get_context</code>（<code>sysmsg_lib.c:318</code>）。</li>
+  <li><strong>交接协议</strong>：sysmsg 线程用 <code>FUTEX_WAKE(ctx->state)</code> 通知 sentry「这个 ctx 准备好了」；
+    sentry 处理完用 <code>contextQueue.add()</code> + <code>kickSysmsgThread()</code>/wakeup 通知 sysmsg 线程「有活可干」。
+    两端的 futex 分别是 <code>ctx->state</code> 和 <code>queue->num_threads_to_wakeup</code>。</li>
+  <li>状态标记用 <strong><code>CONTEXT_STATE_SYSCALL_TRAP</code></strong>（区别于信号路径的 <code>CONTEXT_STATE_SYSCALL</code>），
+    sentry 侧 <code>switchToApp</code> 把两者等价处理（<code>subprocess.go:876</code>）。</li>
+</ol>
+
+<h2>3.6 guest 上下文切换示例（A 执行 syscall → 切到 B）</h2>
+
+<p>最直观的多 guest 场景：<strong>两个 guest context A、B 先后被同一个 sysmsg 线程 T 服务</strong>（注意 A/B 并不永久
+绑定某线程，而是 M:N 池化调度的结果，见 §2.1.2）。A 跑着跑着执行一个 <code>svc</code>，此刻发生什么？</p>
+
+<p>结论：<strong>会切到 B，但有两个前提</strong>——</p>
+<ol>
+  <li><strong>只有 B 此刻在 run queue（可运行）里</strong>，<code>get_context()</code> 才会弹出 B 并 <code>eret</code> 到 B；
+    否则 T 会 futex 阻塞睡下，而不是空转。</li>
+  <li><strong>A 的 syscall 不是在这条路径上同步完成的</strong>：A 被"上交"给 sentry 后，T 立刻切去跑 B；A 的系统调用由
+    sentry <strong>异步</strong>执行，A 的 <code>svc</code> 要到"未来某个时刻"才真正返回。</li>
+</ol>
+
+<p>核心心智：<strong>sysmsg 线程从不执行 guest 的 syscall</strong>。handler 只做「保存 A → 上交 A → 换 B 继续跑」，
+真正的 syscall 由 sentry 走自己的 syscall 表完成。</p>
+
+<pre><code>
+       sysmsg 线程 T (host)                              sentry (goroutine)
+ ─────────────────────────────────────────────────────────────────────────────
+  t0 │ 运行 guest A 的代码
+  t1 │ A 执行 svc #0
+  t2 │ FGT handler: 保存 A 的 x0..x30/FP → ctx_A
+  t3 │ __syshandler → switch_context(A, SYSCALL_TRAP):
+     │    ├─ ctx_A.state = SYSCALL_TRAP   ── futex WAKE ──▶  waitOnState() 醒来
+     │    └─ get_context() 弹出 ctx_B（sysmsg-&gt;context = B）
+  t4 │ 汇编恢复 B 的寄存器 → eret → 开始跑 B
+     ╞══════════ 并行：B 在跑，A 的 syscall 在 sentry 中执行 ══════════
+     │                                                    │ 读 ctx_A.regs
+     │                                                    │  (x8=号, x0..x5=参)
+     │                                                    │ 执行 syscall
+     │                                                    │ 返回值写 ctx_A.regs[0]
+     │                                                    │ contextQueue.add(A)
+  t7 │ （某个 sysmsg 线程）弹出 ctx_A，恢复 A 的寄存器
+     │ eret 回 A 的「svc 下一条指令」，x0 已是返回值
+</code></pre>
+
+<p>对应源码：切换就发生在 <code>__syshandler</code>（<code>sighandler_arm64.c:270</code>）→
+<code>switch_context_arm64</code>（<code>sighandler_arm64.c:234</code>）→ <code>switch_context</code>
+（<code>sysmsg_lib.c:382</code>）：标记 A 为 <code>SYSCALL_TRAP</code>、<code>FUTEX_WAKE</code> 唤醒 sentry，
+然后 <code>get_context()</code>（<code>sysmsg_lib.c:318</code>）弹出 B 并 <code>sysmsg-&gt;context = B</code>
+（<code>sysmsg_lib.c:241</code>）；回到汇编 <code>fgt_handler_arm64.S:169-176</code>，用
+<code>msr ELR_EL0 / SPSR_EL0 + eret</code> 跳进 B 的代码段。</p>
+
+<ul>
+  <li><strong>若 B 不可运行</strong>：<code>get_context()</code> 里 <code>queue_get_context()</code> 返回 NULL，走
+    futex 等待（<code>sysmsg_lib.c:361-372</code>，<code>FUTEX_WAIT</code> on <code>num_threads_to_wakeup</code>），
+    T 置 <code>THREAD_STATE_ASLEEP</code> 睡下；等 sentry 完成 A 的 syscall 并 <code>contextQueue.add()</code> +
+    <code>kickSysmsgThread()</code> 唤醒它，再弹出（很可能就是 A 自己，带返回值）恢复并 <code>eret</code>。</li>
+  <li><strong>FP 正确性</strong>：切到 B 时 <code>switch_context_arm64</code> 判
+    <code>old_ctx(A) != ctx(B)</code>，强制 <code>ctx-&gt;fpstate_changed = 1</code>（<code>sighandler_arm64.c:259-261</code>），
+    让汇编重新加载 B 的 FPSIMD，避免带上 A 的浮点状态。</li>
+</ul>
+
+<h2>3.7 优化前 vs 优化后（信号路径 vs FGT fast path）</h2>
+
+<p>两条路径的<strong>sentry 侧完全相同</strong>（<code>switchToApp</code> → 执行 syscall → 再入队），差异全部集中在
+<strong>sysmsg 线程侧</strong>「guest 发起 <code>svc</code> → 进入 handler」和「handler 返回 guest」这两段。</p>
+
+<h3>3.7.1 逐项对比</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>优化前：信号路径（slow path）</th><th>优化后：FGT fast path</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>入口触发</td><td><code>svc</code> 陷 EL1，seccomp/ptrace 拦截后内核投递 <code>SIGSYS</code></td>
+        <td><code>svc</code> 被 FGT 硬件直接重定向到 <code>VBAR_EL0_FGT</code>（全程 EL0）</td></tr>
+    <tr><td>入口函数</td><td><code>__export_sighandler</code>（<code>sighandler_arm64.c:101</code>，信号处理上下文）</td>
+        <td><code>__export_fgt_stub</code> → <code>__export_fgt_handler</code></td></tr>
+    <tr><td>定位 sysmsg</td><td>从栈地址反推 <code>sysmsg_sp()/sysmsg_addr()</code></td>
+        <td><code>x18</code>（stub 烤入的 per-thread 指针）</td></tr>
+    <tr><td>寄存器来源</td><td>信号帧 <code>ucontext</code>（<code>gregs_to_ptregs</code>）</td>
+        <td>硬件 <code>ELR_EL0</code>/<code>SPSR_EL0</code> + 原样保留的 <code>x0-x30</code></td></tr>
+    <tr><td>FP 保存</td><td>解析信号帧 FPSIMD context（校验 magic）</td>
+        <td>汇编直接 <code>stp q0-q31 + fpsr/fpcr</code></td></tr>
+    <tr><td>状态标记</td><td><code>CONTEXT_STATE_SYSCALL</code></td>
+        <td><code>CONTEXT_STATE_SYSCALL_TRAP</code></td></tr>
+    <tr><td>返回 guest</td><td><code>restore_state</code>（<code>sighandler_arm64.c:215</code>）填 ucontext → <code>rt_sigreturn</code></td>
+        <td><code>msr ELR_EL0/SPSR_EL0</code> + <code>eret</code></td></tr>
+    <tr><td>中断协调</td><td>SIGCHLD 且 <code>state!=NONE</code> 直接 return</td>
+        <td>PREP/NONE + <code>ctx-&gt;interrupt</code> 舞步</td></tr>
+    <tr><td>额外开销</td><td>信号帧构造 + sigreturn + seccomp 过滤</td>
+        <td>无</td></tr>
+  </tbody>
+</table>
+
+<h3>3.7.2 两条路径的流程对照（泳道图）</h3>
+
+<p>慢路径多出一条泳道——<strong>host 内核（EL1）</strong>：<code>svc</code> 先陷进内核、经 seccomp/ptrace 拦截后以
+<code>SIGSYS</code> 信号形式投递回 sysmsg 线程；fast path 则全程 EL0，不经过内核、无信号帧。</p>
+
+<pre><code>
+◆ 优化前：信号路径（slow path）—— 多一跳 host 内核 EL1，信号帧 + rt_sigreturn
+
+  guest(EL0)     host 内核(EL1)            sysmsg 线程(host)             sentry(goroutine)
+      │                │                          │                           │
+   svc #0              │                          │                           │
+      │── 硬件陷 EL1 ──>│                          │                           │
+      │                │ seccomp/ptrace 拦截        │                           │
+      │                │ 决定投递 SIGSYS            │                           │
+      │                │──── 投递 SIGSYS 信号 ─────>│                           │
+      │                │                          │ __export_sighandler()     │
+      │                │                          │  gregs_to_ptregs(ucontext)│
+      │                │                          │  拷贝 FPSIMD(校验 magic)   │
+      │                │                          │  signo=SIGSYS, si_syscall │
+      │                │                          │ switch_context(SYSCALL)   │
+      │                │                          │  └ futex WAKE ───────────>│ waitOnState() 唤醒
+      │                │                          │     get_context() 阻塞     │ switchToApp()→isSyscall
+      │                │                          │                           │ 执行 syscall
+      │                │                          │                           │ 写 ac.Regs[0]
+      │                │                          │                           │ contextQueue.add(ctx)
+      │                │                          │<── futex wake/弹出 ctx ────│
+      │                │                          │ restore_state() 填 ucontext│
+      │<──── rt_sigreturn 恢复寄存器回 guest ───────│ (返回信号处理, 由内核完成)  │
+
+◆ 优化后：FGT fast path —— 全程 EL0，无信号帧，无 rt_sigreturn
+
+  guest(EL0)     sysmsg 线程(host)                sentry(goroutine)
+      │                 │                             │
+   svc #0              │                             │
+      │── FGT 重定向 ──>│  (硬件直接跳 VBAR_EL0_FGT)    │
+      │                 │ __export_fgt_stub            │
+      │                 │  x18=sysmsg, 切私有栈         │
+      │                 │ __export_fgt_handler          │
+      │                 │  保存 x0..x30/FP → ctx        │
+      │                 │ __syshandler()                │
+      │                 │  signo=SIGSYS, si_syscall=x8  │
+      │                 │ switch_context_arm64()        │
+      │                 │  └ switch_context(SYSCALL_TRAP)│
+      │                 │     ├─ ctx.state=TRAP         │
+      │                 │     └─ futex WAKE ───────────>│ waitOnState() 唤醒
+      │                 │     get_context() 阻塞         │ switchToApp()→isSyscall
+      │                 │                               │ 执行 syscall
+      │                 │                               │ 写 ac.Regs[0]
+      │                 │                               │ contextQueue.add(ctx)
+      │                 │<── futex wake/弹出 ctx ────────│
+      │                 │ 恢复 x0..x30 + msr ELR_EL0/SPSR_EL0
+      │<──── eret ──────│ (重新使能 FGT)                 │
+</code></pre>
+
+<p><strong>一句话概括</strong>：优化只改了两段——<strong>入口</strong>（<code>svc→EL1→信号</code> 换成
+<code>svc→VBAR_EL0_FGT</code>）和<strong>出口</strong>（<code>rt_sigreturn</code> 换成 <code>eret</code>），
+中间的 <code>switch_context</code>、<code>get_context</code>、<code>contextQueue</code>、sentry 的
+<code>switchToApp</code> 全部复用，因此改动面小、风险可控。</p>
+
+<hr>
+
+<h2>4. 实现步骤（按文件）</h2>
+
+<h3>4.1 入口 stub（新）</h3>
+<ul>
+  <li>新增 stub 字节模板（Go 常量或 <code>.S</code> + 运行时烤指针），结构见 §2。</li>
+  <li>在 <code>stub_unsafe.go</code> 的 per-thread 区旁、或 <code>subprocess.go</code> 的 <code>newSysmsgThread</code>（≈:1106）里，
+    为每个线程分配一页 RX 并写入烤好指针的 stub，记录 stub 地址到 <code>sysmsgThread</code>。</li>
+</ul>
+
+<h3>4.2 <code>fgt.go</code> + <code>subprocess.go</code></h3>
+<ul>
+  <li><code>fgtHandlerAddr()</code>（<code>fgt.go:58</code>）改/增为「每线程 stub 地址」：<code>injectFGTEnable(t)</code> 用
+    <strong>该线程的 stub 地址</strong>调 <code>prctl(71,1,stub)</code>。</li>
+  <li><code>subprocess.go:1159</code>：FGT 使能时把 <code>msg.Syshandler</code> 设为 <code>__export_fgt_handler</code>（共享
+    handler 地址），供 stub 第 5 行 <code>ldr</code> 使用。</li>
+  <li><code>alignExecMapEndForFGT</code>（<code>fgt.go:65</code>）逻辑基本不变（共享 handler 仍在 blob 内 4KB 对齐）。</li>
+</ul>
+
+<h3>4.3 <code>sysmsg/fgt_handler_arm64.S</code>（重写）</h3>
+<ul>
+  <li>删掉现在「保存 X0-X30 → 重发 SVC → ERET」的 forwarder，改为 §3.2 的真实 handler。</li>
+  <li>保留 <code>.balign 4096</code>（共享 handler 地址需 4KB 对齐）。</li>
+  <li>复用/参照 <code>syshandler_amd64.S</code> 的 <code>prepare_enter/exit_syshandler</code>、<code>save/restore_fpstate</code>
+    结构，改写成 arm64 的 <code>stp</code>/<code>mrs</code>/<code>msr</code>。</li>
+</ul>
+
+<h3>4.4 偏移量（新 <code>sysmsg_offsets_arm64.h</code>）</h3>
+<ul>
+  <li>现有 <code>sysmsg_offsets.h</code> 只有 sysmsg 字段偏移（<code>self/ret_addr/.../context</code>，通用）+ amd64 的
+    ptregs 偏移。需新增 arm64 的 <code>offsetof_thread_context_ptregs_regsN</code> / <code>_sp</code> / <code>_pc</code> / <code>_pstate</code>
+    （对应 <code>linux.PtraceRegs{Regs[31],Sp,Pc,Pstate}</code>，见 <code>ptrace_arm64.go:60</code>）。</li>
+  <li>在 <code>sysmsg_lib.c:verify_offsets()</code> 或 <code>sighandler_arm64.c</code> 加对应 <code>BUILD_BUG_ON</code>。</li>
+</ul>
+
+<h3>4.5 FP 状态（<code>sysmsg_arm64.go</code> ArchState + handler）</h3>
+<ul>
+  <li><code>ArchState</code> 目前只有 <code>fpLen</code>（<code>sysmsg_arm64.go:35</code>）。首版只支持 FPSIMD（与现有 sighandler
+    的 <code>kFpsimdContextSize</code> 一致），handler 用 <code>stp q0-q31</code> + <code>fpsr</code>/<code>fpcr</code> 保存/恢复。</li>
+  <li>首版不考虑 SVE：若 guest 启用 SVE 则禁用 FGT（走信号路径）或 panic，避免误保存。</li>
+</ul>
+
+<h3>4.6 <code>sighandler_arm64.c</code>（中断协调）</h3>
+<ul>
+  <li>移植 AMD64 <code>sighandler_amd64.c:223-225</code> 的「SIGCHLD 且 <code>state != THREAD_STATE_NONE</code> 直接
+    return」逻辑：fast path 里（state=PREP）到达的信号被推迟，由 handler 退出前检查
+    <code>ctx-&gt;interrupt</code> 补处理。</li>
+  <li><code>switch_context</code> 本身（<code>sysmsg_lib.c:382</code>）架构无关，无需改。</li>
+</ul>
+
+<h3>4.7 seccomp</h3>
+<ul>
+  <li><code>sysmsg_thread_arm64.go</code> 已放行 <code>prctl(71)</code>；sysmsg 线程的 futex/sched_yield 等已放行，无需新增。</li>
+</ul>
+
+<hr>
+
+<h2>5. 验证</h2>
+
+<ol>
+  <li><strong>编译</strong>：<code>bazel build //pkg/sentry/platform/systrap/...</code>（arm64 交叉或原生）。</li>
+  <li><strong>单测 stub 生成</strong>：对烤指针逻辑写 Go 单测（给定 sysmsg 地址 → 反汇编/字节断言）。</li>
+  <li><strong>功能</strong>：在带自定义内核的 arm64 机器上跑 systrap 集成测试（<code>runsc do</code> / syscall 测试），
+    重点回归：多线程并发 syscall、<code>switch_context</code> 上下文迁移、信号中断（SIGCHLD）协调。</li>
+  <li><strong>正确性对照</strong>：FGT 关 vs 开跑同一组 syscall 测试，结果一致。</li>
+  <li><strong>性能</strong>：<code>runsc</code> syscall 延迟微基准，对比 FGT 关（走信号路径）与开（fast path），
+    预期接近 AMD64 syshandler 的量级（消掉信号帧+sigreturn+seccomp）。</li>
+</ol>
+
+<hr>
+
+<h2>6. 待确认（内核侧语义，本地内核树没有该扩展，只能由内核侧确认）</h2>
+
+<p>已确认：<strong>per-thread stub（烤指针）</strong> 作身份机制；<strong>仅 ERET 重新使能</strong> FGT；
+<strong><code>ELR_EL0</code>/<code>SPSR_EL0</code> 在 EL0 可 <code>msr</code>/<code>mrs</code></strong>；<strong>全量保存 GPR（含 x18）</strong>；<strong>首版不考虑 SVE（仅 FPSIMD）</strong>。</p>
+
+</body>
+</html>

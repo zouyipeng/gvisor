@@ -16,6 +16,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
@@ -27,7 +28,7 @@ static int loops = 10000000;
 enum syscall_type { get_pid, get_pid_opt };
 enum seccomp_policy { seccomp_none, seccomp_cacheable, seccomp_uncacheable };
 
-#ifdef __x86_64__
+#if defined(__x86_64__)
 
 #define SYSNO_STR1(x) #x
 #define SYSNO_STR(x) SYSNO_STR1(x)
@@ -37,6 +38,21 @@ void do_getpidopt() {
     "syscall\n"
     : : : "rax", "rcx", "r11");
 }
+
+#define AUDIT_ARCH_CURRENT AUDIT_ARCH_X86_64
+
+#elif defined(__aarch64__)
+
+void do_getpidopt() {
+  __asm__("mov x8, %0\n"
+    "svc #0\n"
+    : : "r" ((long)SYS_getpid) : "x8", "x0", "x1", "x2", "x3", "x4", "x5", "memory");
+}
+
+#define AUDIT_ARCH_CURRENT AUDIT_ARCH_AARCH64
+
+#else
+#error "Unsupported architecture"
 #endif
 
 static void show_usage(const char *cmd) {
@@ -66,8 +82,8 @@ static void set_cacheable_filter() {
   struct sock_filter filter[] = {
       // A = seccomp_data.arch
       BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 4),
-      // if (A != AUDIT_ARCH_X86_64) goto kill
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 2),
+      // if (A != AUDIT_ARCH_CURRENT) goto kill
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_CURRENT, 0, 2),
       // A = seccomp_data.nr
       BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0),
       // return SECCOMP_RET_ALLOW
@@ -93,8 +109,8 @@ static void set_uncacheable_filter() {
   struct sock_filter filter[] = {
       // A = seccomp_data.arch
       BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 4),
-      // if (A != AUDIT_ARCH_X86_64) goto kill
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 3),
+      // if (A != AUDIT_ARCH_CURRENT) goto kill
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_CURRENT, 0, 3),
       // A = seccomp_data.nr
       BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0),
       // A = seccomp_data.args[0]
