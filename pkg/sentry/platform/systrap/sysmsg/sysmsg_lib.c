@@ -412,6 +412,7 @@ void verify_offsets() {
   BUILD_BUG_ON(offsetof_sysmsg_interrupt != offsetof(struct sysmsg, interrupt));
   BUILD_BUG_ON(offsetof_sysmsg_state != offsetof(struct sysmsg, state));
   BUILD_BUG_ON(offsetof_sysmsg_context != offsetof(struct sysmsg, context));
+  BUILD_BUG_ON(offsetof_sysmsg_debug != offsetof(struct sysmsg, debug));
 
   BUILD_BUG_ON(offsetof_thread_context_fpstate !=
                offsetof(struct thread_context, fpstate));

@@ -100,6 +100,8 @@ struct thread_context {
   uint64_t tls;
   uint64_t debug;
   uint64_t err;
+  uint64_t fgt_vbar;
+  uint64_t fgt_pstate;
 };
 
 enum stub_error {

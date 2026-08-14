@@ -303,7 +303,6 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 				return
 			}
 		}
-
 		id, ok := s.sysmsgStackPool.Get()
 		if !ok {
 			handlePtraceSyscallRequestError(req, "unable to allocate a sysmsg stub thread")
@@ -814,6 +813,7 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
 	s.resetSysemuRegs(regs)
+	setFGTPstate(regs)
 	ctx := c.sharedContext
 	ctx.shared.Regs = regs.PtraceRegs
 	restoreArchSpecificState(ctx.shared, ac)
@@ -869,6 +869,22 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	// don't respect other signals.
 	c.signalInfo = ctx.shared.SignalInfo
 	ctxState := ctx.state()
+	// Resolve the sysmsg thread that just ran this context to log its host
+	// thread PID (getpid) and FGT fast-path counters, so FEAT_FGT diagnostics
+	// can be correlated with kernel prints.
+	var fgtPid int32
+	var fgtStubCalls, fgtHandlerCalls uint64
+	lastThreadID := ctx.lastThreadID()
+	if lastThreadID != invalidThreadID {
+		s.sysmsgThreadsMu.RLock()
+		if sysThread, ok := s.sysmsgThreads[lastThreadID]; ok {
+			fgtPid = sysThread.thread.tgid
+			fgtStubCalls = sysThread.msg.Debug >> 32
+			fgtHandlerCalls = sysThread.msg.Debug & 0xFFFFFFFF
+		}
+		s.sysmsgThreadsMu.RUnlock()
+	}
+	log.Debugf("FEAT_FGT: switchToApp pid=%d state=%s pc=0x%x sysno=%d fgt_stub_calls=%d fgt_handler_calls=%d vbar_el0_fgt=0x%x pstate=0x%x tindex=%d", fgtPid, ctxState, regs.Pc, regs.Regs[8], fgtStubCalls, fgtHandlerCalls, ctx.shared.FgtVbar, ctx.shared.FgtPstate, (ctx.shared.FgtPstate>>14)&1)
 	if ctxState == sysmsg.ContextStateSyscallCanBePatched {
 		ctxState = sysmsg.ContextStateSyscall
 		shouldPatchSyscall = true
@@ -1157,6 +1173,11 @@ func (s *subprocess) createSysmsgThread() error {
 	sysThread.msg.Self = uint64(sysmsgStackAddr + sysmsg.MsgOffsetFromSharedStack)
 	sysThread.msg.SyshandlerStack = uint64(sysmsg.StackAddrToSyshandlerStack(sysThread.sysmsgPerThreadMemAddr()))
 	sysThread.msg.Syshandler = uint64(stubSysmsgStart + uintptr(sysmsg.Sighandler_blob_offset____export_syshandler))
+	if fgtEnabled {
+		// The FGT fast path entry stub jumps to the shared fast-path handler
+		// (rather than the unimplemented __export_syshandler).
+		sysThread.msg.Syshandler = fgtHandlerAddr()
+	}
 
 	sysThread.msg.State.Set(sysmsg.ThreadStateInitializing)
 
@@ -1182,6 +1203,26 @@ func (s *subprocess) createSysmsgThread() error {
 		arch.SyscallArgument{Value: stubSysmsgRules})
 	if err != nil {
 		panic(fmt.Sprintf("seccomp failed: %v", err))
+	}
+
+	// Enable FEAT_FGT for sysmsg threads. This is done here (after
+	// seccomp filter installation) so the filter explicitly allows
+	// prctl(71). The syscall thread and clone-parent threads must
+	// NOT have FGT enabled, because their SVCs need the normal
+	// EL0->EL1 path for ptrace-based syscall injection.
+	var fgtStubAddr uint64
+	if fgtEnabled {
+		fgtStubAddr, err = allocateFGTStub(sysThread)
+		if err != nil {
+			panic(fmt.Sprintf("FEAT_FGT stub allocation failed: %v", err))
+		}
+	}
+	if err := injectFGTEnable(p, fgtStubAddr); err != nil {
+		panic(fmt.Sprintf("FEAT_FGT prctl failed: %v", err))
+	}
+	if fgtEnabled {
+		log.Infof("FEAT_FGT: thread=%d fgtStubAddr(VBAR_EL0_FGT)=0x%x msg.Self=0x%x msg.Syshandler=0x%x msg.SyshandlerStack=0x%x",
+			threadID, fgtStubAddr, sysThread.msg.Self, sysThread.msg.Syshandler, sysThread.msg.SyshandlerStack)
 	}
 
 	// Prepare to start the BPF process.

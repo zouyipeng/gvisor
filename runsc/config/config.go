@@ -440,6 +440,9 @@ type Config struct {
 	// SystrapDisableFastPath disables the Systrap fast path entirely.
 	SystrapDisableFastPath bool `flag:"systrap-disable-fast-path"`
 
+	// SystrapDisableFGT disables FEAT_FGT in Systrap on ARM64.
+	SystrapDisableFGT bool `flag:"systrap-disable-fgt"`
+
 	// Nftables enables support for nftables to be used instead of iptables.
 	Nftables bool `flag:"TESTONLY-nftables"`
 

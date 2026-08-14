@@ -277,6 +277,8 @@ func New(opts platform.Options) (*Systrap, error) {
 		disableSyscallPatching = opts.DisableSyscallPatching
 	}
 
+	SetFGTEnabled(!opts.DisableFGT)
+
 	if maxSysmsgThreads == 0 {
 		// CPUID information has been initialized at this point.
 		archState.Init()
@@ -400,7 +402,15 @@ func init() {
 
 func createMemoryFile() (*pgalloc.MemoryFile, error) {
 	const memfileName = "systrap-memory"
-	fd, err := memutil.CreateMemFD(memfileName, 0)
+	// MFD_EXEC makes the memfd executable even when vm.memfd_noexec is set.
+	// The ARM64 FEAT_FGT per-thread entry stub is mmap'd RX from this memfd
+	// (see fgt_stub_arm64.go), so the memfd must be executable. Fall back to
+	// flags=0 on kernels that predate MFD_EXEC (Linux < 6.3); FEAT_FGT will
+	// not work there, but nothing else regresses.
+	fd, err := memutil.CreateMemFD(memfileName, unix.MFD_EXEC)
+	if err == unix.EINVAL {
+		fd, err = memutil.CreateMemFD(memfileName, 0)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("error creating memfd: %v", err)
 	}

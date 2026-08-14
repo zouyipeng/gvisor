@@ -183,6 +183,14 @@ func (sc *sharedContext) threadID() uint32 {
 	return atomic.LoadUint32(&sc.shared.ThreadID)
 }
 
+// lastThreadID returns the ID of the sysmsg thread that most recently ran this
+// context. It is set by the stub in switch_context() when the context is handed
+// back to the sentry (unlike threadID(), which is reset to invalidThreadID at
+// that point).
+func (sc *sharedContext) lastThreadID() uint32 {
+	return atomic.LoadUint32(&sc.shared.LastThreadID)
+}
+
 // EnableSentryFastPath indicates that the polling mode is enabled for the
 // Sentry. It has to be called before putting the context into the context queue.
 func (sc *sharedContext) enableSentryFastPath() {

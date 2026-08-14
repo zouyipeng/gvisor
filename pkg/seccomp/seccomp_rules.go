@@ -1008,13 +1008,16 @@ func (sr SyscallRules) ForSingleArgument(sysno uintptr, argNum int, fn func(Valu
 
 // DenyNewExecMappings is a set of rules that denies creating new executable
 // mappings and converting existing ones.
+//
+// TEMPORARY (FEAT_FGT verification): the mprotect(PROT_EXEC) deny rule is
+// removed so that the ARM64 FEAT_FGT per-thread entry stub can be mmap'd RW,
+// baked with the thread's sysmsg pointer, then flipped to RX at runtime. See
+// pkg/sentry/platform/systrap/fgt_stub_arm64.go:allocateFGTStub. This weakens
+// the Sentry's code-injection hardening; restore once the FGT stub pages are
+// pre-mapped executable before the seccomp filter is installed (no runtime
+// W->X transition).
 var DenyNewExecMappings = MakeSyscallRules(map[uintptr]SyscallRule{
 	unix.SYS_MMAP: PerArg{
-		AnyValue{},
-		AnyValue{},
-		MaskedEqual(unix.PROT_EXEC, unix.PROT_EXEC),
-	},
-	unix.SYS_MPROTECT: PerArg{
 		AnyValue{},
 		AnyValue{},
 		MaskedEqual(unix.PROT_EXEC, unix.PROT_EXEC),

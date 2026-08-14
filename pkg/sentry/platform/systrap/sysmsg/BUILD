@@ -19,7 +19,10 @@ cc_pie_obj(
             "sighandler_amd64.c",
             "sysmsg_offsets_amd64.h",
         ],
-        arm64 = ["sighandler_arm64.c"],
+        arm64 = [
+            "sighandler_arm64.c",
+            "sysmsg_offsets_arm64.h",
+        ],
     ) + [
         "atomic.h",
         "sysmsg.h",
@@ -62,6 +65,31 @@ cc_pie_obj(
     outs = ["syshandler.o"],
 )
 
+cc_pie_obj(
+    name = "fgt_handler",
+    srcs = select_arch(
+        amd64 = ["fgt_dummy_amd64.S"],
+        arm64 = [
+            "fgt_handler_arm64.S",
+            "sysmsg_offsets.h",
+            "sysmsg_offsets_arm64.h",
+        ],
+    ),
+    outs = ["fgt_handler.o"],
+)
+
+cc_pie_obj(
+    name = "fgt_stub",
+    srcs = select_arch(
+        amd64 = ["fgt_dummy_amd64.S"],
+        arm64 = [
+            "fgt_stub_arm64.S",
+            "sysmsg_offsets.h",
+        ],
+    ),
+    outs = ["fgt_stub.o"],
+)
+
 genrule(
     name = "sighandler_object",
     srcs = [
@@ -70,12 +98,15 @@ genrule(
         ":syshandler",
         ":sysrestorer",
         ":sysmsg_lib",
+        ":fgt_handler",
+        ":fgt_stub",
     ],
     outs = ["sighandler.built-in.bin.o"],
     cmd = "$(LD) " +
           "-pie -z noexecstack -T $(location pie.lds.S) " +
           "$(location :sysrestorer) $(location :sighandler) " +
           "$(location :syshandler) $(location :sysmsg_lib) " +
+          "$(location :fgt_handler) $(location :fgt_stub) " +
           "-o $@",
     features = ["-pie"],
     toolchains = [

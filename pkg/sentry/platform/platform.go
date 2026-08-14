@@ -592,6 +592,11 @@ type Options struct {
 	// DisableFastPath, if true, completely disables the Systrap fast path.
 	DisableFastPath bool
 
+	// DisableFGT disables FEAT_FGT (Fine Grained Traps) on ARM64.
+	// When enabled (default), stub processes configure VBAR_EL0_FGT for
+	// faster syscall redirection. Disable if the host CPU lacks FEAT_FGT.
+	DisableFGT bool
+
 	// ApplicationCores is used by KVM to determine the correct amount of
 	// vCPUs to create.
 	ApplicationCores int

@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
@@ -83,6 +84,8 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 						seccomp.EqualTo(stubStart),
 						seccomp.EqualTo(stubROMapEnd - stubStart),
 					},
+					// Allow FEAT_FGT enable/disable (prctl option 71).
+					seccomp.PerArg{seccomp.EqualTo(71), seccomp.AnyValue{}},
 				},
 				unix.SYS_GETPPID: seccomp.MatchAll{},
 
@@ -285,9 +288,18 @@ func (t *thread) createStub() (*thread, error) {
 	// We unfortunately don't have a handy part of memory to write the wait
 	// status. If the wait succeeds, we'll assume that it was the SIGSTOP.
 	// If the child actually exited, the attach below will fail.
-	_, err = unix.Wait4(int(pid), nil, unix.WALL|unix.WUNTRACED, nil)
+	var ws unix.WaitStatus
+	_, err = unix.Wait4(int(pid), &ws, unix.WALL|unix.WUNTRACED, nil)
 	if err != nil {
 		return nil, fmt.Errorf("waiting on stub process: %v", err)
+	}
+	if ws.Exited() {
+		log.Warningf("FEAT_FGT: stub child %d exited with status %d (signal: %d) instead of SIGSTOP",
+			pid, ws.ExitStatus(), ws.Signal())
+	} else if ws.Stopped() {
+		log.Debugf("FEAT_FGT: stub child %d stopped by signal %d", pid, ws.StopSignal())
+	} else {
+		log.Warningf("FEAT_FGT: stub child %d unexpected wait status: %v", pid, ws)
 	}
 
 	childT := &thread{
@@ -308,9 +320,14 @@ func (s *subprocess) createStub() (*thread, error) {
 		return nil, fmt.Errorf("createStub: failed to get clone")
 	}
 	if err := childT.attach(); err != nil {
+		if FGTEnabled() {
+			log.Warningf("FEAT_FGT: stub attach failed (FGT enabled): %v", err)
+			return nil, fmt.Errorf("%w (FEAT_FGT/FGT is enabled; if the host CPU does not support FEAT_FGT, retry with --systrap-disable-fgt)", err)
+		}
 		return nil, err
 	}
 	childT.grabInitRegs()
 
+	log.Debugf("FEAT_FGT: stub created successfully, tid=%d", childT.tid)
 	return childT, nil
 }

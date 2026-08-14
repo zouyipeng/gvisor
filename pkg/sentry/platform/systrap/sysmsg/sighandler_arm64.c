@@ -29,6 +29,7 @@
 #include "atomic.h"
 #include "sysmsg.h"
 #include "sysmsg_offsets.h"
+#include "sysmsg_offsets_arm64.h"
 
 // TODO(b/271631387): These globals are shared between AMD64 and ARM64; move to
 // sysmsg_lib.c.
@@ -64,6 +65,13 @@ static __inline uint64_t get_tls() {
   uint64_t tls;
   __asm__("mrs %0,tpidr_el0" : "=r"(tls));
   return tls;
+}
+
+static __inline uint64_t get_vbar_el0_fgt() {
+  uint64_t vbar;
+  // VBAR_EL0_FGT = sys_reg(3, 3, 11, 1, 0).
+  __asm__("mrs %0,s3_3_c11_c1_0" : "=r"(vbar));
+  return vbar;
 }
 
 long sys_futex(uint32_t *addr, int op, int val, struct __kernel_timespec *tv,
@@ -111,6 +119,13 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
     // Find a new context and exit to restore it.
     init_new_thread();
     goto init;
+  }
+
+  // If the current thread is in the syshandler fast path, an interrupt has to
+  // be postponed, because sysmsg can't be changed. The fast path re-checks
+  // ctx->interrupt before resuming. See __syshandler below.
+  if (signo == SIGCHLD && thread_state != THREAD_STATE_NONE) {
+    return;
   }
 
   ctx = sysmsg->context;
@@ -218,5 +233,152 @@ void restore_state(struct sysmsg *sysmsg, struct thread_context *ctx,
   }
   ptregs_to_gregs(ucontext, &ctx->ptregs);
   set_tls(ctx->tls);
+  // Diagnostic: sample VBAR_EL0_FGT and the guest PSTATE just before
+  // dispatching the guest so the sentry can verify the kernel configured FGT
+  // (see subprocess.go switchToApp). PSTATE bit 14 (TINDEX_EL0_FGT) arms the
+  // SVC->VBAR_EL0_FGT redirect; it is only enabled when the sentry has set it
+  // in the guest context's PSTATE.
+  ctx->fgt_vbar = get_vbar_el0_fgt();
+  ctx->fgt_pstate = ctx->ptregs.pstate;
   atomic_store(&sysmsg->state, THREAD_STATE_NONE);
+}
+
+// switch_context_arm64 is the fast-path wrapper of switch_context() with
+// interrupt coordination (mirrors switch_context_amd64).
+static struct thread_context *switch_context_arm64(
+    struct sysmsg *sysmsg, struct thread_context *ctx,
+    enum context_state new_context_state) {
+  struct thread_context *old_ctx = sysmsg->context;
+
+  for (;;) {
+    ctx = switch_context(sysmsg, ctx, new_context_state);
+
+    // After setting THREAD_STATE_NONE, the syshandler can be interrupted by
+    // SIGCHLD. In this case the current context contains the actual state and
+    // the sighandler can take control of it.
+    atomic_store(&sysmsg->state, THREAD_STATE_NONE);
+    if (atomic_load(&ctx->interrupt) != 0) {
+      atomic_store(&sysmsg->state, THREAD_STATE_PREP);
+      // This context got interrupted while it was waiting in the queue. Set up
+      // the necessary bits to let the sentry know this context has switched
+      // back because of it.
+      atomic_store(&ctx->interrupt, 0);
+      new_context_state = CONTEXT_STATE_FAULT;
+      ctx->signo = SIGCHLD;
+      ctx->siginfo.si_signo = SIGCHLD;
+    } else {
+      break;
+    }
+  }
+  if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id) {
+    ctx->fpstate_changed = 1;
+  }
+  return ctx;
+}
+
+// __syshandler is the C part of the FEAT_FGT fast path. It is called from
+// fgt_handler_arm64.S with the current thread's sysmsg already loaded into the
+// (already-saved) registers, after the guest state has been saved to
+// ctx->ptregs/fpstate. It populates the syscall siginfo and switches to the
+// next context; on return the assembly restores it and ERETs to the guest.
+void __syshandler(struct sysmsg *sysmsg) {
+  // Diagnostic: count FGT fast-path handler entries, observable from the sentry
+  // via sysmsg->debug (see subprocess.go switchToApp).
+  atomic_add(&sysmsg->debug, 1);
+
+  // THREAD_STATE_PREP is set by the assembly entry to postpone interrupts.
+  int state = atomic_load(&sysmsg->state);
+  if (state != THREAD_STATE_PREP) panic(STUB_ERROR_BAD_THREAD_STATE, 0);
+
+  struct thread_context *ctx = sysmsg->context;
+
+  ctx->signo = SIGSYS;
+  ctx->siginfo.si_addr = 0;
+  ctx->siginfo.si_syscall = ctx->ptregs.regs[8];
+  // Unlike amd64 (where %rax holds the syscall number, not an argument), on
+  // arm64 x0/regs[0] is the *first syscall argument* as well as the return
+  // value register. Do NOT overwrite it here: the sentry reads arg0 from
+  // regs[0] via SyscallSaveOrig() before dispatching the syscall, and sets the
+  // return value itself. The amd64 equivalent (rax = -ENOSYS) is only a
+  // placeholder for the return register, which on arm64 would clobber arg0.
+  ctx->tls = get_tls();
+
+  atomic_store(&ctx->fpstate_changed, 0);
+  ctx = switch_context_arm64(sysmsg, ctx, CONTEXT_STATE_SYSCALL_TRAP);
+
+  set_tls(ctx->tls);
+}
+
+void verify_offsets_arm64() {
+#define PTREGS_OFFSET offsetof(struct thread_context, ptregs)
+  BUILD_BUG_ON(offsetof_thread_context_ptregs != PTREGS_OFFSET);
+  BUILD_BUG_ON(offsetof_user_regs_regs0 !=
+               offsetof(struct user_regs_struct, regs[0]));
+  BUILD_BUG_ON(offsetof_user_regs_regs1 !=
+               offsetof(struct user_regs_struct, regs[1]));
+  BUILD_BUG_ON(offsetof_user_regs_regs2 !=
+               offsetof(struct user_regs_struct, regs[2]));
+  BUILD_BUG_ON(offsetof_user_regs_regs3 !=
+               offsetof(struct user_regs_struct, regs[3]));
+  BUILD_BUG_ON(offsetof_user_regs_regs4 !=
+               offsetof(struct user_regs_struct, regs[4]));
+  BUILD_BUG_ON(offsetof_user_regs_regs5 !=
+               offsetof(struct user_regs_struct, regs[5]));
+  BUILD_BUG_ON(offsetof_user_regs_regs6 !=
+               offsetof(struct user_regs_struct, regs[6]));
+  BUILD_BUG_ON(offsetof_user_regs_regs7 !=
+               offsetof(struct user_regs_struct, regs[7]));
+  BUILD_BUG_ON(offsetof_user_regs_regs8 !=
+               offsetof(struct user_regs_struct, regs[8]));
+  BUILD_BUG_ON(offsetof_user_regs_regs9 !=
+               offsetof(struct user_regs_struct, regs[9]));
+  BUILD_BUG_ON(offsetof_user_regs_regs10 !=
+               offsetof(struct user_regs_struct, regs[10]));
+  BUILD_BUG_ON(offsetof_user_regs_regs11 !=
+               offsetof(struct user_regs_struct, regs[11]));
+  BUILD_BUG_ON(offsetof_user_regs_regs12 !=
+               offsetof(struct user_regs_struct, regs[12]));
+  BUILD_BUG_ON(offsetof_user_regs_regs13 !=
+               offsetof(struct user_regs_struct, regs[13]));
+  BUILD_BUG_ON(offsetof_user_regs_regs14 !=
+               offsetof(struct user_regs_struct, regs[14]));
+  BUILD_BUG_ON(offsetof_user_regs_regs15 !=
+               offsetof(struct user_regs_struct, regs[15]));
+  BUILD_BUG_ON(offsetof_user_regs_regs16 !=
+               offsetof(struct user_regs_struct, regs[16]));
+  BUILD_BUG_ON(offsetof_user_regs_regs17 !=
+               offsetof(struct user_regs_struct, regs[17]));
+  BUILD_BUG_ON(offsetof_user_regs_regs18 !=
+               offsetof(struct user_regs_struct, regs[18]));
+  BUILD_BUG_ON(offsetof_user_regs_regs19 !=
+               offsetof(struct user_regs_struct, regs[19]));
+  BUILD_BUG_ON(offsetof_user_regs_regs20 !=
+               offsetof(struct user_regs_struct, regs[20]));
+  BUILD_BUG_ON(offsetof_user_regs_regs21 !=
+               offsetof(struct user_regs_struct, regs[21]));
+  BUILD_BUG_ON(offsetof_user_regs_regs22 !=
+               offsetof(struct user_regs_struct, regs[22]));
+  BUILD_BUG_ON(offsetof_user_regs_regs23 !=
+               offsetof(struct user_regs_struct, regs[23]));
+  BUILD_BUG_ON(offsetof_user_regs_regs24 !=
+               offsetof(struct user_regs_struct, regs[24]));
+  BUILD_BUG_ON(offsetof_user_regs_regs25 !=
+               offsetof(struct user_regs_struct, regs[25]));
+  BUILD_BUG_ON(offsetof_user_regs_regs26 !=
+               offsetof(struct user_regs_struct, regs[26]));
+  BUILD_BUG_ON(offsetof_user_regs_regs27 !=
+               offsetof(struct user_regs_struct, regs[27]));
+  BUILD_BUG_ON(offsetof_user_regs_regs28 !=
+               offsetof(struct user_regs_struct, regs[28]));
+  BUILD_BUG_ON(offsetof_user_regs_regs29 !=
+               offsetof(struct user_regs_struct, regs[29]));
+  BUILD_BUG_ON(offsetof_user_regs_regs30 !=
+               offsetof(struct user_regs_struct, regs[30]));
+  BUILD_BUG_ON(offsetof_user_regs_sp !=
+               offsetof(struct user_regs_struct, sp));
+  BUILD_BUG_ON(offsetof_user_regs_pc !=
+               offsetof(struct user_regs_struct, pc));
+  BUILD_BUG_ON(offsetof_user_regs_pstate !=
+               offsetof(struct user_regs_struct, pstate));
+#undef PTREGS_OFFSET
 }

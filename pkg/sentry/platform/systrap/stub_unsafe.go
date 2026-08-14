@@ -193,6 +193,10 @@ func stubInit() {
 	mapLen, _ = hostarch.PageRoundUp(mapLen + uintptr(stubSysmsgLen))
 	stubExecMapEnd := mapLen
 
+	// Ensure the executable mapping covers the FEAT_FGT handler
+	// page (which is 4KB-aligned within the sysmsg blob).
+	stubExecMapEnd = alignExecMapEndForFGT(stubSysmsgStart, stubExecMapEnd)
+
 	stubSysmsgRules = mapLen
 	stubSysmsgRulesLen = hostarch.PageSize * 2
 	mapLen += stubSysmsgRulesLen
