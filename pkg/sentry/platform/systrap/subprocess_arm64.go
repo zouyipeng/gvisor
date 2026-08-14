@@ -41,6 +41,17 @@ const (
 func (s *subprocess) resetSysemuRegs(regs *arch.Registers) {
 }
 
+// setFGTPstate arms the FEAT_FGT SVC redirect by setting TINDEX_EL0_FGT
+// (PSTATE bit 14) in the guest PSTATE. Without this bit the guest's SVC
+// instructions keep taking the normal EL0->EL1 path even though VBAR_EL0_FGT is
+// configured, so the FGT fast path would never be entered. It is a no-op when
+// FGT is disabled.
+func setFGTPstate(regs *arch.Registers) {
+	if fgtEnabled {
+		regs.Pstate |= fgtPstateTindex
+	}
+}
+
 // createSyscallRegs sets up syscall registers.
 //
 // This should be called to generate registers for a system call.

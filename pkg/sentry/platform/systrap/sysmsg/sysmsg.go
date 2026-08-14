@@ -157,6 +157,11 @@ type Msg struct {
 	Line int32
 	// Debug is a variable to use to get visibility into the stub from the sentry.
 	Debug uint64
+	// DebugEnabled is set by the sentry when debug logging is enabled. When
+	// zero, the stub skips its per-syscall FEAT_FGT diagnostic counters and
+	// VBAR_EL0_FGT sampling so they don't tax the syscall fast path. See
+	// subprocess.go:createSysmsgThread.
+	DebugEnabled uint32
 	// ThreadID is the ID of the sysmsg thread.
 	ThreadID uint32
 }
@@ -204,6 +209,29 @@ const (
 	// ContextStateInvalid is an invalid state that the sentry should never see.
 	ContextStateInvalid
 )
+
+// String returns a human-readable name for the context state, used in
+// diagnostic logging.
+func (s ContextState) String() string {
+	switch s {
+	case ContextStateNone:
+		return "None"
+	case ContextStateSyscall:
+		return "Syscall"
+	case ContextStateFault:
+		return "Fault"
+	case ContextStateSyscallTrap:
+		return "SyscallTrap"
+	case ContextStateSyscallCanBePatched:
+		return "SyscallCanBePatched"
+	case ContextStateUnexpectedDeath:
+		return "UnexpectedDeath"
+	case ContextStateInvalid:
+		return "Invalid"
+	default:
+		return fmt.Sprintf("ContextState(%d)", uint32(s))
+	}
+}
 
 const (
 	// MaxFPStateLen is the largest possible FPState that we will save.
@@ -281,6 +309,12 @@ type ThreadContext struct {
 	Debug uint64
 	// SigError is an error code that clarifies the nature of the signal.
 	SigError uint64
+	// FgtVbar is the value of VBAR_EL0_FGT sampled just before dispatching the
+	// guest (slow path only), used to diagnose FEAT_FGT enable state.
+	FgtVbar uint64
+	// FgtPstate is the guest PSTATE sampled just before dispatching the guest.
+	// Bit 14 (TINDEX_EL0_FGT) selects whether SVC is redirected to VBAR_EL0_FGT.
+	FgtPstate uint64
 }
 
 // StubError are values that represent known stub-thread failure modes.

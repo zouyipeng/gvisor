@@ -66,6 +66,7 @@ struct sysmsg {
   int32_t err_additional;
   int32_t err_line;
   uint64_t debug;
+  uint32_t debug_enabled;
   uint32_t thread_id;
 };
 
@@ -100,6 +101,8 @@ struct thread_context {
   uint64_t tls;
   uint64_t debug;
   uint64_t err;
+  uint64_t fgt_vbar;
+  uint64_t fgt_pstate;
 };
 
 enum stub_error {

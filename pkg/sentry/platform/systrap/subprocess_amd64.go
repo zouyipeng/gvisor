@@ -47,6 +47,9 @@ func (s *subprocess) resetSysemuRegs(regs *arch.Registers) {
 	regs.Gs = s.sysmsgInitRegs.Gs
 }
 
+// setFGTPstate is a no-op on amd64: FEAT_FGT is ARM64-only.
+func setFGTPstate(_ *arch.Registers) {}
+
 // createSyscallRegs sets up syscall registers.
 //
 // This should be called to generate registers for a system call.
