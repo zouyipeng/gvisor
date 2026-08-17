@@ -80,6 +80,10 @@ $CC -static -O2 -Wall \
     "$GVISOR_DIR/images/benchmarks/syscallbench/syscallbench.c" \
     -o "$OUTPUT_DIR/initramfs/syscallbench"
 
+# FGT 性能对比脚本
+cp "$GVISOR_DIR/bench_fgt.sh" "$OUTPUT_DIR/initramfs/bench_fgt.sh"
+chmod +x "$OUTPUT_DIR/initramfs/bench_fgt.sh"
+
 	# init: 进 shell，不自动跑 gVisor
 	cat > "$OUTPUT_DIR/initramfs/init" << 'INIT'
 #!/bin/sh
@@ -90,6 +94,7 @@ echo ""
 echo "===== gVisor ARM64 Shell ====="
 echo "  /runsc          -- gVisor sandbox"
 echo "  /syscallbench   -- syscall benchmark"
+echo "  /bench_fgt.sh   -- FGT 开/关性能对比 (./bench_fgt.sh [loops] [runs])"
 echo "  /gvisor-test.sh -- 一键测试脚本"
 echo ""
 exec /bin/sh
@@ -120,7 +125,7 @@ echo "===== [2/2] Running gVisor (systrap) with FGT DISABLED ====="
 /runsc --TESTONLY-unsafe-nonroot --rootless --network none \
     --debug --alsologtostderr \
     --platform=systrap \
-    --systrap-disable-fdt \
+    --systrap-disable-fgt \
     do /syscallbench
 FGT_DISABLED_RC=$?
 echo "===== FGT disabled exit code: $FGT_DISABLED_RC ====="

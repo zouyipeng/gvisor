@@ -173,20 +173,46 @@ qemu-system-aarch64 \
   -nic none
 ```
 
-进入 shell 后，直接运行：
+进入 shell 后，直接运行 FGT 开/关性能对比（核心用例）：
 
 ```bash
-run-benchmark          # 默认 1M loops
-run-benchmark 10000000 # 自定 loop 数
+/bench_fgt.sh             # 默认 1M loops，每场景跑 3 次取 min
+/bench_fgt.sh 1000000 5   # 自定 loops 与 runs
 ```
 
-脚本会自动执行 4 项测试并输出结果表格：
+脚本只对比 **FGT ON vs FGT OFF**（getpid + getpidopt），同时给出 `elapsed_ns`（总耗时）
+与 `ns/call`（单次耗时），收益用 `+xx%` / `-xx%` 表示（`+` = FGT 降低延迟有收益，
+`-` = 劣化）：
 
 ```
-  native getpid:              Xs  (Y ns/call)
-  native getpidopt:           Xs  (Y ns/call)
-  gvisor getpid:              Xs  (Y ns/call)
-  gvisor getpidopt:           Xs  (Y ns/call)
+  syscall         ON elapsed_ns   OFF elapsed_ns    ON ns/call   OFF ns/call      收益
+  ------------    --------------  ---------------   ----------   -----------    -------
+  getpid              1500100000        4200500000      1500.10       4200.50   +64.3%
+  getpidopt            900300000        2500400000       900.30       2500.40   +64.0%
+```
+
+> 收益公式：`(FGT OFF - FGT ON) / FGT OFF * 100%`。因 loops 相同，
+> `elapsed_ns` 与 `ns/call` 同比例，二者算出的收益一致；`elapsed_ns` 为原始总耗时，
+> 数值更大、更便于直观对比。
+
+> 说明：`syscallbench` 已在内部用 `CLOCK_MONOTONIC_RAW` 计时，输出 `# RESULT ...`
+> 机器可读行，因此 ns/call 不含 runsc 启动/销毁开销。FGT 关通过
+> `runsc --systrap-disable-fgt do ...` 触发（走信号路径），FGT 开走 `VBAR_EL0_FGT`
+> fast path，二者对比即为 FGT 收益。
+
+也可以单独手动运行某项：
+
+```bash
+# native（基线参考，脚本不再自动跑）
+/syscallbench --loops=1000000 --syscall=1
+
+# gVisor FGT 开（默认）
+/runsc --TESTONLY-unsafe-nonroot --rootless --network none --platform=systrap \
+  do /syscallbench --loops=1000000 --syscall=1
+
+# gVisor FGT 关
+/runsc --TESTONLY-unsafe-nonroot --rootless --network none --platform=systrap \
+  --systrap-disable-fgt do /syscallbench --loops=1000000 --syscall=1
 ```
 
 ### 6.3 注意事项

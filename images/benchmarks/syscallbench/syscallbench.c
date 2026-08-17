@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static int loops = 10000000;
@@ -54,6 +55,14 @@ void do_getpidopt() {
 #else
 #error "Unsupported architecture"
 #endif
+
+// Monotonic raw clock in nanoseconds. Used for internal timing so that the
+// reported latency excludes process startup / runsc sandbox setup overhead.
+static uint64_t now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static void show_usage(const char *cmd) {
   fprintf(stderr,
@@ -189,6 +198,7 @@ int main(int argc, char *argv[]) {
       exit(1);
   }
 
+  uint64_t start = now_ns();
   switch (sys_val) {
     case (int)get_pid:
       for (i = 0; i < loops; i++) syscall(SYS_getpid);
@@ -201,7 +211,13 @@ int main(int argc, char *argv[]) {
       show_usage(argv[0]);
       exit(1);
   }
+  uint64_t elapsed_ns = now_ns() - start;
 
+  // Machine-parseable result line: scripts grep for "# RESULT" and read the
+  // trailing ns_per_call field.
   printf("# Executed %'d calls\n", loops);
+  printf("# RESULT syscall=%d loops=%d elapsed_ns=%llu ns_per_call=%.2f\n",
+         sys_val, loops, (unsigned long long)elapsed_ns,
+         (double)elapsed_ns / (double)loops);
   return 0;
 }
